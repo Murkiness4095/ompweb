@@ -147,7 +147,7 @@ buildNpmPackage (finalAttrs: {
     cp ${geist} app/fonts/Geist.ttf
   '';
 
-  npmDepsHash = "sha256-3oF6aA3/KxJTRC0ONX4ztG5s13b+IJqIHk1u4LVT1GQ=";
+  npmDepsHash = "sha256-mz719Dc+abZPlqY5BeOOupU7h+Em3pwPB+erga3mj7E=";
 
   npmPackFlags = [ "--ignore-scripts" ];
 
