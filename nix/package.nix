@@ -97,15 +97,22 @@ buildNpmPackage (finalAttrs: {
     cp ${notoSerifSC} app/fonts/NotoSerifSC-VF.otf
     cp ${jetBrainsMono} app/fonts/JetBrainsMono.ttf
     cp ${geist} app/fonts/Geist.ttf
+  '';
 
-    # Swap next/font/google for next/font/local, which is the only part of the build
-    # that needs network access (Google serves the font binaries at build time, and the
-    # Nix sandbox has none).
-    #
-    # Done by a script rather than a `patches` diff on purpose: a diff has to restate
-    # app/layout.tsx's import block verbatim, so it breaks the moment upstream edits
-    # that file for any unrelated reason. The script rewrites only the module
-    # specifier and generates app/fonts/local-fonts.ts alongside the vendored faces.
+  # Swap next/font/google for next/font/local. Google serves the font binaries over the
+  # network at build time and the Nix sandbox has none, so this is the only step in the
+  # build that needs substituting.
+  #
+  # It lives in preBuild, not postPatch, on purpose: buildNpmPackage forwards postPatch
+  # to the separate `npmDeps` derivation, which runs in a stdenv with no node on PATH.
+  # Putting a `node` invocation in postPatch therefore breaks every build that has to
+  # recompute npmDepsHash — i.e. every sync that touches package-lock.json. preBuild is
+  # not forwarded, so it runs only in the derivation that actually runs `next build`.
+  #
+  # A script rather than a `patches` diff, because a diff against app/layout.tsx has to
+  # restate that file's import block and every font call verbatim, and so breaks the
+  # moment upstream edits layout.tsx for any unrelated reason.
+  preBuild = ''
     node ${./local-fonts-shim.mjs} app/layout.tsx app/fonts
   '';
 
