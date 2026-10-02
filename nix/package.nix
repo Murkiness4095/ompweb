@@ -2,8 +2,6 @@
   lib,
   buildNpmPackage,
   fetchurl,
-  writeText,
-  ...
 }:
 let
   notoSansMono = fetchurl {
@@ -36,73 +34,38 @@ let
     hash = "sha256-c4lOBEjK6QqStsL4cyt7uay3uUxBi/9Vna1KGOHellk=";
   };
 
-  localFontsPatch = writeText "ompweb-local-fonts.patch" ''
-    diff --git a/app/layout.tsx b/app/layout.tsx
-    --- a/app/layout.tsx
-    +++ b/app/layout.tsx
-    @@ -1,45 +1,46 @@
-     import type { Metadata, Viewport } from "next";
-     import Script from "next/script";
-    -import { Geist, JetBrains_Mono, Noto_Sans_Mono, Noto_Serif_SC, Source_Serif_4 } from "next/font/google";
-    +import localFont from "next/font/local";
-     import { ThemeColor } from "@/hooks/useTheme";
-     import { IosFocusZoomGuard } from "@/components/IosFocusZoomGuard";
-     import { SIDEBAR_HISTORY_BRIDGE_SCRIPT } from "@/lib/sidebar-history-bridge";
-     import "./globals.css";
+  # Root-level build inputs are discovered rather than listed by hand. An explicit list
+  # fails *evaluation* — not just the build — the next time upstream adds a root config
+  # file, which is exactly how `next-env.d.ts` broke this flake: it is gitignored, so it
+  # is never in a clean checkout, yet the fileset demanded it.
+  #
+  # `next-env.d.ts` stays excluded explicitly: `next build` generates it, so a local
+  # build may have left one in the tree and it must not change the source hash.
+  buildFileExtensions = [
+    ".ts"
+    ".tsx"
+    ".mts"
+    ".mjs"
+    ".cjs"
+    ".js"
+    ".json"
+  ];
 
-    -const geist = Geist({
-    -  subsets: ["latin"],
-    +const geist = localFont({
-    +  src: "./fonts/Geist.ttf",
-    +  weight: "100 900",
-       variable: "--font-geist",
-       display: "swap",
-     });
+  rootEntries = builtins.readDir ../.;
 
-    -const jetbrainsMono = JetBrains_Mono({
-    -  subsets: ["latin"],
-    -  weight: ["400", "500", "600"],
-    +const jetbrainsMono = localFont({
-    +  src: "./fonts/JetBrainsMono.ttf",
-    +  weight: "100 800",
-       variable: "--font-jb-mono",
-       display: "swap",
-     });
-
-    -const notoSansMono = Noto_Sans_Mono({
-    -  subsets: ["latin", "cyrillic"],
-    +const notoSansMono = localFont({
-    +  src: "./fonts/NotoSansMono.ttf",
-    +  weight: "100 900",
-       variable: "--font-noto-mono",
-       display: "swap",
-     });
-
-     // Display serif pair for the warm-humanistic heading voice: Source Serif 4
-     // covers latin, Noto Serif SC covers CJK. Both expose CSS variables consumed
-     // by --font-serif in globals.css.
-    -const sourceSerif = Source_Serif_4({
-    -  subsets: ["latin"],
-    +const sourceSerif = localFont({
-    +  src: "./fonts/SourceSerif4Variable-Roman.otf",
-    +  weight: "200 900",
-       variable: "--font-source-serif",
-       display: "swap",
-     });
-
-    -const notoSerifSC = Noto_Serif_SC({
-    -  // CJK glyphs are served via unicode-range slices regardless of subset;
-    -  // "latin" satisfies next/font's preloading requirement.
-    -  subsets: ["latin"],
-    -  weight: ["600", "700"],
-    +const notoSerifSC = localFont({
-    +  src: "./fonts/NotoSerifSC-VF.otf",
-    +  weight: "200 900",
-       variable: "--font-noto-serif",
-       display: "swap",
-     });
-
-  '';
+  rootBuildFiles = lib.fileset.unions (
+    map
+      (name: lib.fileset.maybeMissing (../. + "/${name}"))
+      (
+        builtins.filter
+          (
+            name: rootEntries.${name} == "regular"
+              && builtins.any (suffix: lib.hasSuffix suffix name) buildFileExtensions
+              && name != "next-env.d.ts"
+          )
+          (builtins.attrNames rootEntries)
+      )
+  );
 
   productionLib = lib.fileset.difference ../lib (
     lib.fileset.fileFilter (file: lib.hasInfix ".test." file.name) ../lib
@@ -118,17 +81,7 @@ let
       productionLib
       ../public
       ../scripts
-
-      ../instrumentation.ts
-      ../instrumentation.node.ts
-      ../next.config.ts
-      ../next-env.d.ts
-      ../package.json
-      ../package-lock.json
-      ../postcss.config.mjs
-      ../tailwind.config.ts
-      ../tsconfig.json
-      ../proxy.ts
+      rootBuildFiles
     ];
   };
   version = (builtins.fromJSON (builtins.readFile ../package.json)).version;
@@ -137,8 +90,6 @@ buildNpmPackage (finalAttrs: {
   pname = "ompweb";
   inherit src version;
 
-  patches = [ localFontsPatch ];
-
   postPatch = ''
     mkdir -p app/fonts
     cp ${notoSansMono} app/fonts/NotoSansMono.ttf
@@ -146,6 +97,16 @@ buildNpmPackage (finalAttrs: {
     cp ${notoSerifSC} app/fonts/NotoSerifSC-VF.otf
     cp ${jetBrainsMono} app/fonts/JetBrainsMono.ttf
     cp ${geist} app/fonts/Geist.ttf
+
+    # Swap next/font/google for next/font/local, which is the only part of the build
+    # that needs network access (Google serves the font binaries at build time, and the
+    # Nix sandbox has none).
+    #
+    # Done by a script rather than a `patches` diff on purpose: a diff has to restate
+    # app/layout.tsx's import block verbatim, so it breaks the moment upstream edits
+    # that file for any unrelated reason. The script rewrites only the module
+    # specifier and generates app/fonts/local-fonts.ts alongside the vendored faces.
+    node ${./local-fonts-shim.mjs} app/layout.tsx app/fonts
   '';
 
   npmDepsHash = "sha256-HxT+m6bI0I3t9sqsSgHun6oXve3WtIEmkFpCoBplrC4=";
@@ -155,5 +116,9 @@ buildNpmPackage (finalAttrs: {
   meta = {
     description = "Local web UI for the oh-my-pi (omp) coding agent";
     license = lib.licenses.mit;
+    # The package installs five binaries (ompweb plus the tray/launchd/systemd helpers).
+    # Without an explicit mainProgram, `nix run` only works by accident — because the
+    # package name happens to match a binary name.
+    mainProgram = "ompweb";
   };
 })
