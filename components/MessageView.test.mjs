@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import "../tests/setup-dom.mjs";
 import test, { afterEach } from "node:test";
 import React from "react";
-import { act, cleanup, fireEvent, render } from "@testing-library/react/pure.js";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react/pure.js";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createJiti } from "jiti";
 
@@ -52,7 +52,11 @@ test("message Markdown copy preserves source, excludes activity, and confirms su
     const button = view.getByRole("button", { name: "Copy as Markdown" });
     await act(async () => { fireEvent.click(button); });
     assert.equal(clipboard, message.role === "user" ? source : `${source}\n\n## Conclusion\n\nDone.`);
-    assert.equal(button.textContent, "Copied");
+    // The click handler's copy chain (clipboard write -> setCopied) resolves on a
+    // microtask that can land AFTER act's flush under load, leaving the "Copied"
+    // label uncommitted when this line reads the DOM. waitFor lets React commit
+    // instead of racing the scheduler (flaked under parallel suite load).
+    await waitFor(() => assert.equal(button.textContent, "Copied"));
     view.unmount();
   }
 });
@@ -77,6 +81,45 @@ test("plain Copy keeps full oversized message source instead of the reveal contr
     assert.equal(clipboard, source);
     view.unmount();
   }
+});
+
+test("expanded oversized user message can be collapsed again", (t) => {
+  // Layout stub: capped bubbles overflow; an uncapped bubble fits its content.
+  const observers = [];
+  const originalResizeObserver = globalThis.ResizeObserver;
+  globalThis.ResizeObserver = class {
+    constructor(callback) { this.callback = callback; observers.push(this); }
+    observe() {}
+    disconnect() {}
+  };
+  const proto = window.HTMLElement.prototype;
+  const scrollHeight = Object.getOwnPropertyDescriptor(proto, "scrollHeight");
+  const clientHeight = Object.getOwnPropertyDescriptor(proto, "clientHeight");
+  Object.defineProperty(proto, "scrollHeight", { configurable: true, get() { return 1000; } });
+  Object.defineProperty(proto, "clientHeight", {
+    configurable: true,
+    get() { return this.style.maxHeight === "none" ? 1000 : 300; },
+  });
+  t.after(() => {
+    globalThis.ResizeObserver = originalResizeObserver;
+    for (const [name, descriptor] of [["scrollHeight", scrollHeight], ["clientHeight", clientHeight]]) {
+      if (descriptor) Object.defineProperty(proto, name, descriptor);
+      else delete proto[name];
+    }
+  });
+
+  const view = render(React.createElement(MessageView, { message: { role: "user", content: "long\n\n".repeat(200) } }));
+  const resize = () => act(() => { for (const observer of observers) observer.callback([]); });
+  fireEvent.click(view.getByRole("button", { name: "Show full input" }));
+  resize();
+  const toggle = view.getByRole("button", { name: "Collapse input" });
+  toggle.focus();
+  fireEvent.click(toggle);
+  // Before re-measuring, the same toggle must stay mounted and focused.
+  assert.equal(document.activeElement, toggle);
+  resize();
+  assert.equal(view.getByRole("button", { name: "Show full input" }), toggle);
+  assert.equal(document.activeElement, toggle);
 });
 
 test("expanded grouped tool inputs follow streaming arguments without toggling output", () => {
@@ -181,6 +224,55 @@ test("expanded tool calls show the compact command header", () => {
   assert.match(html, /aria-expanded="true"/);
   assert.match(html, /tool-call-details/);
   assert.match(html, /\$<\/span><code>read foo\.ts<\/code>/);
+});
+
+test("read paths with an internal URL scheme are not file links", () => {
+  const render = (path) => renderToStaticMarkup(React.createElement(MessageView, {
+    onOpenFile() {},
+    message: {
+      role: "assistant",
+      content: [{ type: "toolCall", toolCallId: "call-1", toolName: "read", input: { path } }],
+    },
+  }));
+
+  for (const path of ["history://ScoutAgent", "proc://Job1", " local://notes.md", "ftp://example.com/a.ts", "javascript://x%0Aalert(1)", "file:///etc/passwd"]) {
+    assert.doesNotMatch(render(path), /activity-file-link|role="link"/, path);
+  }
+  assert.match(render("src/foo.ts:10"), /activity-file-link/);
+});
+
+test("read paths with a web URL open the fetched page in a new tab without toggling the row", () => {
+  const opened = [];
+  const originalOpen = window.open;
+  window.open = (...args) => { opened.push(args.join(" ")); return null; };
+  const openedFiles = [];
+  try {
+    const cases = [
+      [" https://example.com/docs", "https://example.com/docs _blank noopener,noreferrer"],
+      ["HTTPS://Example.com/a:raw", "https://example.com/a _blank noopener,noreferrer"],
+      ["https://example.com:8080/a.md:10-20", "https://example.com:8080/a.md _blank noopener,noreferrer"],
+    ];
+    for (const [path, expected] of cases) {
+      opened.length = 0;
+      const { container, getByRole } = render(React.createElement(MessageView, {
+        onOpenFile(file) { openedFiles.push(file); },
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", toolCallId: "call-1", toolName: "read", input: { path } }],
+        },
+      }));
+      const trigger = container.querySelector("[aria-expanded]");
+      const expanded = trigger.getAttribute("aria-expanded");
+      fireEvent.click(getByRole("link"));
+      fireEvent.keyDown(getByRole("link"), { key: "Enter" });
+      assert.deepEqual(opened, [expected, expected], path);
+      assert.equal(trigger.getAttribute("aria-expanded"), expanded, path);
+      cleanup();
+    }
+  } finally {
+    window.open = originalOpen;
+  }
+  assert.deepEqual(openedFiles, []);
 });
 
 test("ask tool previews question prompts instead of object coercion", () => {
@@ -383,6 +475,86 @@ test("advisor custom messages use the localized advisor label", () => {
   assert.doesNotMatch(html, /customType/);
 });
 
+test("async-result notices start collapsed to their first line and expand to the exact line layout", () => {
+  const view = render(React.createElement(MessageView, {
+    message: {
+      role: "custom",
+      customType: "async-result",
+      content: "<system-notice>\nBackground job bg_1 has completed. Resume your work using the result below.\n/root/repo\n---\nWall time: 0.16 seconds\n</system-notice>",
+      display: true,
+    },
+  }));
+  assert.equal(view.container.querySelector("pre"), null);
+  assert.match(view.container.textContent, /Background job bg_1 has completed\. Resume your work using the result below\. …/);
+  assert.doesNotMatch(view.container.textContent, /Wall time/);
+
+  fireEvent.click(view.getByRole("button", { expanded: false }));
+  const pre = view.container.querySelector("pre");
+  assert.equal(pre.textContent, "Background job bg_1 has completed. Resume your work using the result below.\n/root/repo\n---\nWall time: 0.16 seconds");
+  assert.match(pre.getAttribute("style"), /white-space: pre;/);
+  assert.doesNotMatch(view.container.innerHTML, /system-notice|<h2/);
+});
+
+test("late LSP diagnostic notices expand to their exact line layout", () => {
+  const view = render(React.createElement(MessageView, {
+    message: {
+      role: "custom",
+      customType: "lsp-late-diagnostic",
+      content: "<system-notice>\nLate LSP diagnostics arrived after the edit returned:\n/repo/a.py — 0 error(s), 1 warning(s)\n/repo/a.py:8:1 [warning] [Ruff] Import block is un-sorted or un-formatted\n\nhelp: Organize imports (I001)\n</system-notice>",
+      display: true,
+    },
+  }));
+  fireEvent.click(view.getByRole("button", { expanded: false }));
+  assert.equal(
+    view.container.querySelector("pre").textContent,
+    "Late LSP diagnostics arrived after the edit returned:\n/repo/a.py — 0 error(s), 1 warning(s)\n/repo/a.py:8:1 [warning] [Ruff] Import block is un-sorted or un-formatted\n\nhelp: Organize imports (I001)",
+  );
+  assert.doesNotMatch(view.container.innerHTML, /system-notice/);
+});
+
+test("developer reminders show their wrapper attributes, start collapsed, and toggle from the header", () => {
+  const view = render(React.createElement(MessageView, {
+    message: {
+      role: "custom",
+      customType: "developer",
+      content: [{ type: "text", text: '<system-reminder reason="rule_violation" rule="ts-no-tiny-functions" path="builtin-defaults:ts-no-tiny-functions.md" note="a>b">\nUser-defined rule matched tool-call arguments.\n\n## Why\n\n- One-line wrappers: no real behavior.\n</system-reminder>' }],
+      display: true,
+    },
+  }));
+  const header = view.getByRole("button", { expanded: false });
+  assert.match(header.textContent, /^system-reminder · reason=rule_violation · rule=ts-no-tiny-functions · path=builtin-defaults:ts-no-tiny-functions\.md · note=a>b/);
+  // A `>` inside an attribute value must not leak wrapper syntax into the body.
+  assert.match(view.container.textContent, /User-defined rule matched tool-call arguments\. …/);
+  assert.doesNotMatch(view.container.textContent, /b">/);
+  assert.doesNotMatch(view.container.textContent, /One-line wrappers/);
+
+  fireEvent.click(header);
+  assert.equal(header.getAttribute("aria-expanded"), "true");
+  assert.match(view.container.textContent, /One-line wrappers: no real behavior/);
+  assert.doesNotMatch(view.container.textContent, /<system-reminder/);
+
+  fireEvent.click(header);
+  assert.doesNotMatch(view.container.textContent, /One-line wrappers/);
+});
+
+test("a deferred thinking block rendered from a block subset loads its source block", async (t) => {
+  const requested = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    requested.push(String(url));
+    return new Response(JSON.stringify({ thinking: "loaded" }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const view = render(React.createElement(MessageView, {
+    message: { role: "assistant", provider: "t", model: "m", content: [{ type: "thinking", thinking: "", deferred: true }] },
+    sessionId: "s1",
+    entryId: "e1",
+    sourceBlockIndices: [2],
+  }));
+  await act(async () => { fireEvent.click(view.container.querySelector(".activity-row-trigger")); });
+  assert.equal(requested.length, 1);
+  assert.match(requested[0], /\/entries\/e1\/thinking\?blockIndex=2$/);
+});
 
 test("a running tool call shows a spinner instead of the no-result marker", () => {
   const html = renderToStaticMarkup(React.createElement(MessageView, {
@@ -642,6 +814,8 @@ test("a streaming reply and an unforkable row keep no fork action", () => {
     message: reply, entryId: "assistant-3", forkEntryId: "user-1", onFork: () => {}, isStreaming: true,
   }));
   assert.doesNotMatch(streaming, new RegExp(`aria-label="${FORK_LABEL}"`));
+  assert.doesNotMatch(streaming, /aria-label="Copy message"/);
+  assert.doesNotMatch(streaming, /aria-label="Read aloud"/);
 
   const noTarget = renderToStaticMarkup(React.createElement(MessageView, {
     message: reply, entryId: "assistant-4", onFork: () => {},

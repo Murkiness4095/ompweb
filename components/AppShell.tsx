@@ -5,6 +5,7 @@ import dynamic from "next/dynamic";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useGlobalKeyboardShortcuts } from "@/hooks/useKeyboardShortcuts";
 import { useSidebarHistory } from "@/hooks/useSidebarHistory";
+import { useModalDialog } from "@/hooks/useModalDialog";
 import { SessionSidebar } from "./SessionSidebar";
 import { ToastProvider } from "./ui/toast";
 import { toast } from "./ui/toast";
@@ -15,12 +16,14 @@ import { type FileExplorerHandle } from "./FileExplorer";
 import type { RightPanelView } from "./RightPanel";
 import { BranchNavigator } from "./BranchNavigator";
 import { LanguageSwitcher } from "./LanguageSwitcher";
-import { Check, Ellipsis, Folder, History, Menu, PanelLeft, Terminal, Wand2, Zap } from "lucide-react";
+import { CommandPaletteMount } from "./CommandPaletteMount";
+import { Check, ChevronDown, Command, Ellipsis, Folder, History, Menu, PanelLeft, PanelRight, Terminal, Wand2, X, Zap } from "lucide-react";
 import { ThemeSwitcher } from "./ThemeSwitcher";
 import { translate, useI18n } from "@/lib/i18n";
 import { formatApiError } from "@/lib/i18n/api-error";
 import { formatGenerationSpeed } from "@/lib/generation-speed";
 import { useIsMobile } from "@/hooks/useIsMobile";
+import { useIsCompactOverlay } from "@/hooks/useIsCompactOverlay";
 import { copyText } from "@/lib/clipboard";
 import { encodeFilePathForApi, getFileName, getRelativeFilePath } from "@/lib/file-paths";
 import { buildAtMentionText, buildFileAtMentionsText, buildFileLineMentionText } from "@/lib/file-fuzzy";
@@ -57,8 +60,11 @@ import {
   loadRightPanelWidth,
   loadSidebarWidth,
   projectLabel,
+  WorkspaceState,
 } from "./AppShell-layout";
-import type { ManagedProject, SessionInfo, SessionTreeNode } from "@/lib/types";
+import type { CrossSessionHostToolCall, ManagedProject, SessionInfo, SessionTreeNode } from "@/lib/types";
+import { runHostTool } from "@/hooks/useAgentSession-stream";
+import { sendAgentCommand } from "@/lib/agent-client";
 import type { ChatInputHandle } from "./ChatInput";
 import type { SessionStatsInfo, GenerationSpeedInfo } from "@/lib/pi-types";
 import type { SettingsTab } from "./SettingsTabs";
@@ -83,10 +89,8 @@ const RightPanel = dynamic(() => import("./RightPanel").then((m) => m.RightPanel
 const TOOL_CALLS_COLLAPSED_STORAGE_KEY = "omp-web:tool-calls-collapsed";
 const PROVIDER_USAGE_VISIBLE_STORAGE_KEY = "omp-web:provider-usage-visible";
 const NATIVE_SELECT_ALL_STORAGE_KEY = "omp-web:scope-native-select-all";
+const OPEN_URL_AUTOMATICALLY_STORAGE_KEY = "omp-web:open-url-automatically";
 
-const CommandPalette = dynamic(() => import("./CommandPalette").then((m) => m.CommandPalette), {
-  ssr: false,
-});
 
 type AutoNameStatus =
   | { kind: "idle" }
@@ -101,6 +105,7 @@ export function AppShell() {
   const [initialNavigation] = useState(() => getInitialNavigation(searchParams));
   const { t, locale } = useI18n();
   const isMobile = useIsMobile();
+  const isCompactOverlay = useIsCompactOverlay();
   const [selectedSession, setSelectedSession] = useState<SessionInfo | null>(null);
   // When user clicks +, we only store the cwd — no fake session id
   const [newSessionCwd, setNewSessionCwd] = useState<string | null>(null);
@@ -124,13 +129,31 @@ export function AppShell() {
   const [mobileSidebarReady, setMobileSidebarReady] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState<number>(SIDEBAR_DEFAULT_WIDTH);
   const [toolCallsDefaultCollapsed, setToolCallsDefaultCollapsed] = useState(true);
+  const [hideThinkingBlock, setHideThinkingBlock] = useState(false);
+  useEffect(() => {
+    // omp's own setting, so the transcript hides thinking when the TUI does.
+    // Re-read on focus: the TUI or another tab may have changed it.
+    const load = () => {
+      fetch("/api/omp-settings")
+        .then((response) => (response.ok ? response.json() : null))
+        .then((data: { settings?: { hideThinkingBlock?: boolean } } | null) => { if (data) setHideThinkingBlock(data.settings?.hideThinkingBlock === true); })
+        .catch(() => {});
+    };
+    load();
+    window.addEventListener("focus", load);
+    return () => window.removeEventListener("focus", load);
+  }, []);
   const [providerUsageVisible, setProviderUsageVisible] = useState(true);
   const [scopeNativeSelectAll, setScopeNativeSelectAll] = useState(false);
+  const [openUrlAutomatically, setOpenUrlAutomatically] = useState(false);
   const [sidebarResizing, setSidebarResizing] = useState(false);
   // Active drag handlers so an unmount mid-drag can detach them.
   const sidebarResizeHandlersRef = useRef<{ onMove: (ev: MouseEvent) => void; onUp: () => void } | null>(null);
   // DOM element + live width during a drag (see handleSidebarResizeStart).
-  const sidebarContainerRef = useRef<HTMLDivElement>(null);
+  const sidebarContainerRef = useModalDialog<HTMLElement>({
+    onClose: () => setSidebarOpen(false),
+    active: isMobile && mobileSidebarReady && sidebarOpen && !settingsTab,
+  });
   const pendingSidebarWidthRef = useRef<number>(SIDEBAR_DEFAULT_WIDTH);
   useEffect(() => {
     setSidebarWidth(loadSidebarWidth());
@@ -138,6 +161,7 @@ export function AppShell() {
       setToolCallsDefaultCollapsed(window.localStorage.getItem(TOOL_CALLS_COLLAPSED_STORAGE_KEY) !== "false");
       setProviderUsageVisible(window.localStorage.getItem(PROVIDER_USAGE_VISIBLE_STORAGE_KEY) !== "false");
       setScopeNativeSelectAll(window.localStorage.getItem(NATIVE_SELECT_ALL_STORAGE_KEY) === "true");
+      setOpenUrlAutomatically(window.localStorage.getItem(OPEN_URL_AUTOMATICALLY_STORAGE_KEY) === "true");
     } catch {
       // Keep the compact default when storage is unavailable.
     }
@@ -162,6 +186,14 @@ export function AppShell() {
     setScopeNativeSelectAll(enabled);
     try {
       window.localStorage.setItem(NATIVE_SELECT_ALL_STORAGE_KEY, String(enabled));
+    } catch {
+      // The preference still applies for this page load.
+    }
+  }, []);
+  const handleOpenUrlAutomaticallyChange = useCallback((enabled: boolean) => {
+    setOpenUrlAutomatically(enabled);
+    try {
+      window.localStorage.setItem(OPEN_URL_AUTOMATICALLY_STORAGE_KEY, String(enabled));
     } catch {
       // The preference still applies for this page load.
     }
@@ -237,6 +269,7 @@ export function AppShell() {
     }
   }, [advanceAppUpdateVisibleStage]);
   const [ompUpdateAvailable, setOmpUpdateAvailable] = useState(false);
+  const [ompUpdatesDisabled, setOmpUpdatesDisabled] = useState(false);
   // Bumped on visibilitychange so the mount-time update checks re-run.
   const [updateCheckKey, setUpdateCheckKey] = useState(0);
   // On mobile the sidebar is an overlay drawer; hide it by default so the chat
@@ -269,8 +302,9 @@ export function AppShell() {
       signal: controller.signal,
     })
       .then((response) => response.ok ? response.json() : null)
-      .then((data: { currentVersion?: string | null; availableVersion?: string | null; updateAvailable?: boolean; updateCommand?: string } | null) => {
+      .then((data: { currentVersion?: string | null; availableVersion?: string | null; updateAvailable?: boolean; updateCommand?: string; updatesDisabled?: boolean } | null) => {
         setOmpUpdateAvailable(Boolean(data?.updateAvailable));
+        setOmpUpdatesDisabled(Boolean(data?.updatesDisabled));
         if (!data?.updateAvailable || !data.availableVersion) return;
         // This check re-runs on every visibilitychange back to the tab, so a
         // version the user already dismissed must not be re-announced.
@@ -733,7 +767,10 @@ export function AppShell() {
   }, []);
 
   const handleSidebarToggle = useCallback(() => {
-    if (isMobile) setActiveTopPanel(null);
+    if (isMobile) {
+      setActiveTopPanel(null);
+      if (mobileToolsRef.current) mobileToolsRef.current.open = false;
+    }
     setSidebarOpen((open) => !open);
   }, [isMobile]);
 
@@ -931,16 +968,34 @@ export function AppShell() {
   const [fileTabs, setFileTabs] = useState<Tab[]>([]);
   const [activeFileTabId, setActiveFileTabId] = useState<string | null>(null);
   const [rightPanelOpen, setRightPanelOpen] = useState(false);
+  const [rightPanelHasOpened, setRightPanelHasOpened] = useState(false);
   const [rightView, setRightView] = useState<"explorer" | "git" | "file">("explorer");
   // User-chosen pixel width (null = fluid 42% default), persisted.
   const [rightPanelWidth, setRightPanelWidth] = useState<number | null>(null);
   const [rightPanelResizing, setRightPanelResizing] = useState(false);
-  const rightPanelRef = useRef<HTMLDivElement>(null);
+  // The panel is code-split and mounts a render after its first open, so the
+  // dialog behavior (focus, Escape, Tab wrap) waits until the element exists.
+  // The rest of the page goes inert at the same moment: made inert earlier,
+  // it would drop focus from the opener (e.g. a file link in the chat) before
+  // the dialog records it, and closing could not return focus there.
+  const [rightPanelMounted, setRightPanelMounted] = useState(false);
+  const rightPanelIsModal = isCompactOverlay && rightPanelMounted && rightPanelOpen && !settingsTab;
+  const rightPanelRef = useModalDialog<HTMLDivElement>({
+    onClose: () => setRightPanelOpen(false),
+    active: rightPanelIsModal,
+  });
+  const attachRightPanel = useCallback((element: HTMLDivElement | null) => {
+    rightPanelRef.current = element;
+    setRightPanelMounted(element !== null);
+  }, [rightPanelRef]);
   const pendingRightPanelWidthRef = useRef<number | null>(null);
   const rightResizeHandlersRef = useRef<{ onMove: (ev: MouseEvent) => void; onUp: () => void } | null>(null);
   useEffect(() => {
     setRightPanelWidth(loadRightPanelWidth());
   }, []);
+  useEffect(() => {
+    if (rightPanelOpen) setRightPanelHasOpened(true);
+  }, [rightPanelOpen]);
   // One-shot request asking the explorer tab to expand + scroll to a file.
   const [revealPath, setRevealPath] = useState<string | null>(null);
   const [fileSearchOpen, setFileSearchOpen] = useState(false);
@@ -1071,7 +1126,10 @@ export function AppShell() {
     setSettingsTab(null);
     // Re-picking the current conversation still closes/rearms the drawer,
     // without remounting the chat or disturbing its draft.
-    if (isMobile && !isRestore) setSidebarOpen(false);
+    if (isMobile && !isRestore) {
+      setSidebarOpen(false);
+      requestAnimationFrame(() => chatInputRef.current?.focus());
+    }
     if (!isRestore && session.id === selectedSession?.id) return;
     setNewSessionCwd(null);
     setSelectedSession(session);
@@ -1104,9 +1162,13 @@ export function AppShell() {
     setSystemPrompt(null);
     setSystemPromptLoading(false);
     setActiveTopPanel(null);
-    if (isMobile) setSidebarOpen(false);
+    if (isMobile) {
+      setSidebarOpen(false);
+      requestAnimationFrame(() => chatInputRef.current?.focus());
+    }
     router.replace("/", { scroll: false });
   }, [router, isMobile]);
+
 
   // Global keyboard shortcuts (handles Esc, Ctrl+Alt+N etc.)
   useGlobalKeyboardShortcuts({
@@ -1314,6 +1376,70 @@ export function AppShell() {
     if (isMobile) setSidebarOpen(false);
   }, [isMobile]);
 
+  // Agent open requests that wait for the user. URLs always ask unless the
+  // user opted into opening links from the viewed session automatically; URLs
+  // and files from a session this tab is not viewing always ask, so they cannot
+  // take over the current view. The click is also the user gesture that lets
+  // the new tab through pop-up blockers.
+  const [pendingOpens, setPendingOpens] = useState<Array<{ kind: "url" | "file"; target: string; name: string; sessionId: string; crossSession: boolean }>>([]);
+  const pendingOpen = pendingOpens[0] ?? null;
+  // Keep the last request on screen while the dialog animates closed.
+  const shownOpenRef = useRef(pendingOpen);
+  if (pendingOpen) shownOpenRef.current = pendingOpen;
+  const shownOpen = pendingOpen ?? shownOpenRef.current;
+  const dismissPendingOpen = useCallback(() => setPendingOpens((queue) => queue.slice(1)), []);
+  const requestOpenUrl = useCallback((url: string, sessionId: string, crossSession: boolean): string => {
+    if (!crossSession && openUrlAutomatically) {
+      window.open(url, "_blank", "noopener,noreferrer")?.focus?.();
+      return `Opened ${url}`;
+    }
+    setPendingOpens((queue) => [...queue, { kind: "url", target: url, name: url, sessionId, crossSession }]);
+    return crossSession
+      ? `Asked the user to confirm opening ${url}; they are viewing another omp-web session.`
+      : `Asked the user to confirm opening ${url}.`;
+  }, [openUrlAutomatically]);
+  const handleSessionOpenUrl = useCallback((url: string) => requestOpenUrl(url, selectedSession?.id ?? "", false), [requestOpenUrl, selectedSession?.id]);
+  const handleCrossSessionHostTool = useCallback(async (call: CrossSessionHostToolCall) => {
+    // Full-page Settings hides the chat, so its session counts as not viewed.
+    const viewing = call.sessionId === selectedSession?.id && !settingsTab;
+    const { text, isError } = await runHostTool(call.toolName, call.arguments, {
+      openUrl: (url) => requestOpenUrl(url, call.sessionId, !viewing),
+      openFile: (path, name) => {
+        if (viewing) return handleOpenFile(path, name, call.sessionId);
+        setPendingOpens((queue) => [...queue, { kind: "file", target: path, name, sessionId: call.sessionId, crossSession: true }]);
+        return `Asked the user to confirm opening ${path}; they are viewing another omp-web session.`;
+      },
+    });
+    try {
+      await sendAgentCommand(call.sessionId, {
+        type: "host_tool_result",
+        id: call.id,
+        isError,
+        result: { content: [{ type: "text", text }] },
+      });
+    } catch (e) {
+      console.error("Failed to send host tool result:", e);
+    }
+  }, [handleOpenFile, requestOpenUrl, selectedSession?.id, settingsTab]);
+  const crossSessionHostToolRef = useRef(handleCrossSessionHostTool);
+  useEffect(() => { crossSessionHostToolRef.current = handleCrossSessionHostTool; }, [handleCrossSessionHostTool]);
+  useEffect(() => {
+    // Mounted with the shell (not the sidebar) so it keeps listening on the
+    // full-page Settings view too.
+    const source = new EventSource("/api/agent/host-tools/events");
+    source.onmessage = (e) => {
+      try {
+        const call = JSON.parse(e.data) as CrossSessionHostToolCall & { type?: string };
+        if (call.type === "host_tool_call" && call.sessionId && call.id && call.toolName) {
+          void crossSessionHostToolRef.current({ sessionId: call.sessionId, id: call.id, toolName: call.toolName, arguments: call.arguments ?? {} });
+        }
+      } catch {
+        // ignore malformed frames
+      }
+    };
+    return () => source.close();
+  }, []);
+
   const activeFileTab = fileTabs.find((tab) => tab.id === activeFileTabId) ?? null;
   // Explorer tab browses the active workspace: live cwd first, then the
   // selected / new-session cwd (mirrors what the sidebar used to pass down).
@@ -1520,7 +1646,24 @@ export function AppShell() {
         danger
         onConfirm={sidebarHistory.leave}
       />
-      <CommandPalette
+      <ConfirmDialog
+        open={pendingOpen !== null}
+        onOpenChange={(open) => { if (!open) dismissPendingOpen(); }}
+        title={t(shownOpen?.kind === "file" ? "appShell.openFileTitle" : shownOpen?.crossSession ? "appShell.openUrlTitle" : "appShell.openUrlSameSessionTitle")}
+        description={t(shownOpen?.crossSession ? "appShell.openUrlDescription" : "appShell.openUrlSameSessionDescription", { url: shownOpen?.target ?? "" })}
+        confirmLabel={t("appShell.openUrlConfirm")}
+        cancelLabel={t("appShell.openUrlCancel")}
+        onConfirm={() => {
+          if (pendingOpen?.kind === "url") window.open(pendingOpen.target, "_blank", "noopener,noreferrer");
+          else if (pendingOpen) {
+            // The file panel is hidden behind full-page Settings.
+            setSettingsTab(null);
+            handleOpenFile(pendingOpen.target, pendingOpen.name, pendingOpen.sessionId);
+          }
+          dismissPendingOpen();
+        }}
+      />
+      <CommandPaletteMount
         onSelectSession={handleSelectSession}
         onNewSession={() => {
           // An empty cwd is truthy, so showChat would render the shell while
@@ -1603,8 +1746,10 @@ export function AppShell() {
           box-shadow: none;
         }
       }
-    `}</style>
-    <div style={{ display: "flex", height: "100%", flex: 1, overflow: "hidden", background: "var(--bg)" }}>
+    `}
+    </style>
+    <a href="#main-content" className="skip-link">{t("appShell.skipToContent")}</a>
+    <div style={{ display: "flex", height: "100%", flex: 1, minHeight: 0, minWidth: 0, overflow: "hidden", background: "var(--bg)" }}>
       {/* Left sidebar: hidden on full-page Settings */}
       {!settingsTab && (
         <>
@@ -1623,12 +1768,16 @@ export function AppShell() {
         }}
       />
 
-      {/* Left sidebar */}
-      <div
+      <nav
+        id="workspace-sidebar"
+        role={isMobile ? "dialog" : undefined}
+        aria-modal={isMobile ? true : undefined}
+        tabIndex={-1}
         ref={sidebarContainerRef}
         className={`sidebar-container${sidebarOpen ? " sidebar-open" : " sidebar-closed"}${mobileSidebarReady ? "" : " sidebar-mobile-pending"}${sidebarResizing ? " sidebar-resizing" : ""}`}
-        aria-hidden={mobileSidebarReady && !sidebarOpen ? true : undefined}
-        inert={mobileSidebarReady && !sidebarOpen ? true : undefined}
+        aria-label={t("projects.heading")}
+        aria-hidden={mobileSidebarReady && (!sidebarOpen || rightPanelIsModal) ? true : undefined}
+        inert={mobileSidebarReady && (!sidebarOpen || rightPanelIsModal) ? true : undefined}
         style={{
           background: "var(--bg-panel)",
           borderRight: "1px solid var(--border)",
@@ -1641,11 +1790,12 @@ export function AppShell() {
         }}
       >
         {sidebarContent}
-      </div>
+      </nav>
 
       {/* Resize handle — desktop only, hidden while the sidebar is closed */}
       {!isMobile && sidebarOpen && (
         <div
+          className="sidebar-resize-handle"
           role="separator"
           aria-orientation="vertical"
           aria-label={t("appShell.resizeSidebar")}
@@ -1674,21 +1824,26 @@ export function AppShell() {
       )}
 
       {/* Center: chat */}
-      <main style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minWidth: 0 }}>
+      <main id="main-content" tabIndex={-1} inert={rightPanelIsModal ? true : undefined} style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0, minWidth: 0, overflow: "hidden" }}>
         {settingsTab ? (
           <SettingsConfig
             activeTab={settingsTab}
             toolCallsDefaultCollapsed={toolCallsDefaultCollapsed}
             onToolCallsDefaultCollapsedChange={handleToolCallsDefaultCollapsedChange}
+            onHideThinkingBlockChange={setHideThinkingBlock}
             providerUsageVisible={providerUsageVisible}
             onProviderUsageVisibleChange={handleProviderUsageVisibleChange}
             scopeNativeSelectAll={scopeNativeSelectAll}
             onScopeNativeSelectAllChange={handleScopeNativeSelectAllChange}
+            openUrlAutomatically={openUrlAutomatically}
+            onOpenUrlAutomaticallyChange={handleOpenUrlAutomaticallyChange}
             cwd={activeCwd ?? selectedSession?.cwd ?? newSessionCwd}
             sessionId={selectedSession?.id ?? null}
             onModelsSaved={() => setModelsRefreshKey((k) => k + 1)}
             onPluginsReloaded={() => setSessionKey((k) => k + 1)}
             appUpdate={appUpdate}
+            ompUpdateAvailable={ompUpdateAvailable}
+            ompUpdatesDisabled={ompUpdatesDisabled}
             onRefreshAppUpdate={refreshAppUpdate}
             onOmpUpdateAvailabilityChange={setOmpUpdateAvailable}
             onRequestAppUpdate={requestAppUpdateFromSettings}
@@ -1703,9 +1858,9 @@ export function AppShell() {
           alignItems: "center",
           flexShrink: 0,
           borderBottom: "1px solid var(--border)",
-          minHeight: isMobile ? 44 : 36,
+          minHeight: isMobile ? "calc(44px + env(safe-area-inset-top))" : 36,
           background: "var(--bg-panel)",
-          padding: isMobile ? "0 4px" : "0 8px",
+          padding: isMobile ? "env(safe-area-inset-top) 4px 0" : "0 8px",
           gap: "0 8px",
           minWidth: 0,
         }}>
@@ -1713,6 +1868,8 @@ export function AppShell() {
           <div className="shell-topbar-tools" style={{ display: "flex", alignItems: "center", gap: 4, height: isMobile ? 43 : 35, minWidth: 0, flexShrink: 0 }}>
             <button
               onClick={handleSidebarToggle}
+              aria-expanded={sidebarOpen}
+              aria-controls="workspace-sidebar"
               title={sidebarOpen ? t("appShell.hideSidebar") : t("appShell.showSidebar")}
               aria-label={sidebarOpen ? t("appShell.hideSidebar") : t("appShell.showSidebar")}
               className="shell-toolbar-btn ui-focus-ring"
@@ -1722,8 +1879,8 @@ export function AppShell() {
             <details
               ref={mobileToolsRef}
               className="shell-topbar-overflow"
-              data-compact={compactTopbar === null ? "pending" : compactTopbar}
-              open={compactTopbar ? undefined : true}
+              data-compact={isMobile ? "true" : compactTopbar === null ? "pending" : compactTopbar}
+              open={isMobile ? undefined : compactTopbar ? undefined : true}
               onToggle={(event) => {
                 if (!event.currentTarget.open) setActiveTopPanel(null);
               }}
@@ -1738,6 +1895,22 @@ export function AppShell() {
               <div ref={mobileToolsContentRef} className="shell-topbar-overflow-content">
             <ThemeSwitcher />
             <LanguageSwitcher />
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (isMobile && mobileToolsRef.current) {
+                      mobileToolsRef.current.open = false;
+                      setActiveTopPanel(null);
+                    }
+                    window.dispatchEvent(new Event("omp:open-command-palette"));
+                  }}
+                  title={`${t("commandPalette.label")} (Ctrl/⌘ K)`}
+                  aria-label={t("commandPalette.label")}
+                  aria-keyshortcuts="Control+K Meta+K"
+                  className="shell-toolbar-btn ui-focus-ring"
+                >
+                  <Command size={16} strokeWidth={1.8} aria-hidden="true" />
+                </button>
             {showChat && (
               <>
                 <div className="shell-toolbar-divider" aria-hidden="true" />
@@ -1881,7 +2054,7 @@ export function AppShell() {
                   }}
                 >
                   {effectiveProject ? (
-                    <>
+                    <span className="shell-topbar-project-context" style={{ display: "contents" }}>
                       <Folder size={12} strokeWidth={1.8} style={{ opacity: 0.6, flexShrink: 0 }} aria-hidden="true" />
                       <span
                         style={{
@@ -1898,7 +2071,7 @@ export function AppShell() {
                         {projectLabel(effectiveProject)}
                       </span>
                       <span style={{ color: "var(--text-dim)", flexShrink: 0, opacity: 0.5 }}>/</span>
-                    </>
+                    </span>
                   ) : null}
                   <span
                     style={{
@@ -2033,43 +2206,48 @@ export function AppShell() {
               session={selectedSession}
               newSessionCwd={effectiveNewSessionCwd}
               newSessionWorkspace={effectiveNewSessionCwd && (
-                <div className="mb-4 flex min-w-0 flex-col gap-2">
-                  <label htmlFor="new-session-workspace" style={{ fontSize: 13, fontWeight: 500, color: "var(--text-muted)" }}>
+                <div className="new-session-workspace">
+                  <label id="new-session-workspace-label" htmlFor="new-session-workspace" className="new-session-workspace-label">
                     {t("settingsConfig.chipWorkspace")}
                   </label>
-                  <select
-                    id="new-session-workspace"
-                    aria-describedby="new-session-workspace-path"
-                    value={effectiveNewSessionCwd}
-                    onChange={(event) => {
-                      const cwd = event.target.value;
-                      if (!cwd) {
-                        setAddProjectOpen(true);
-                        return;
-                      }
-                      if (cwd === effectiveNewSessionCwd) return;
-                      suppressCwdRef.current = cwd;
-                      setActiveCwd(cwd);
-                      handleNewSession("", cwd);
-                    }}
-                    style={{ width: "100%", minWidth: 0, minHeight: 44, padding: "8px 12px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "var(--bg-panel)", color: "var(--text)", fontSize: 16 }}
-                  >
-                    {!workspaceOptions.projects.some((project) => comparableProjectPath(project.path) === comparableProjectPath(newSessionProject)) && (
-                      <option value={effectiveNewSessionCwd}>{projectLabel(effectiveNewSessionCwd)}</option>
-                    )}
-                    {workspaceOptions.projects.map((project) => {
-                      const current = comparableProjectPath(project.path) === comparableProjectPath(newSessionProject);
-                      const label = project.alias ?? projectLabel(project.path);
-                      const duplicate = workspaceOptions.projects.some((other) => other.path !== project.path && (other.alias ?? projectLabel(other.path)) === label);
-                      return (
-                        <option key={project.path} value={current ? effectiveNewSessionCwd : project.path}>
-                          {duplicate ? `${label} — ${project.path}` : label}
-                        </option>
-                      );
-                    })}
-                    <option value="">+ {t("projects.add")}</option>
-                  </select>
-                  <div id="new-session-workspace-path" style={{ fontSize: 12, color: "var(--text-muted)", fontFamily: "var(--font-mono)", overflowWrap: "anywhere" }}>
+                  <div className="new-session-workspace-control">
+                    <span className="new-session-workspace-icon" aria-hidden="true">
+                      <Folder size={17} strokeWidth={1.8} />
+                    </span>
+                    <select
+                      id="new-session-workspace"
+                      aria-describedby="new-session-workspace-path"
+                      value={effectiveNewSessionCwd}
+                      onChange={(event) => {
+                        const cwd = event.target.value;
+                        if (!cwd) {
+                          setAddProjectOpen(true);
+                          return;
+                        }
+                        if (cwd === effectiveNewSessionCwd) return;
+                        suppressCwdRef.current = cwd;
+                        setActiveCwd(cwd);
+                        handleNewSession("", cwd);
+                      }}
+                    >
+                      {!workspaceOptions.projects.some((project) => comparableProjectPath(project.path) === comparableProjectPath(newSessionProject)) && (
+                        <option value={effectiveNewSessionCwd}>{projectLabel(effectiveNewSessionCwd)}</option>
+                      )}
+                      {workspaceOptions.projects.map((project) => {
+                        const current = comparableProjectPath(project.path) === comparableProjectPath(newSessionProject);
+                        const label = project.alias ?? projectLabel(project.path);
+                        const duplicate = workspaceOptions.projects.some((other) => other.path !== project.path && (other.alias ?? projectLabel(other.path)) === label);
+                        return (
+                          <option key={project.path} value={current ? effectiveNewSessionCwd : project.path}>
+                            {duplicate ? `${label} — ${project.path}` : label}
+                          </option>
+                        );
+                      })}
+                      <option value="">+ {t("projects.add")}</option>
+                    </select>
+                    <ChevronDown className="new-session-workspace-chevron" size={16} strokeWidth={1.8} aria-hidden="true" />
+                  </div>
+                  <div id="new-session-workspace-path" className="new-session-workspace-path" title={effectiveNewSessionCwd}>
                     {effectiveNewSessionCwd}
                   </div>
                 </div>
@@ -2080,6 +2258,7 @@ export function AppShell() {
               modelsRefreshKey={modelsRefreshKey}
               chatInputRef={chatInputRef}
               onOpenFile={handleOpenLinkedFile}
+              onOpenUrl={handleSessionOpenUrl}
               onBranchDataChange={handleBranchDataChange}
               onSystemPromptChange={handleSystemPromptChange}
               onSystemPromptLoaderChange={handleSystemPromptLoaderChange}
@@ -2088,37 +2267,31 @@ export function AppShell() {
               onGenerationSpeedChange={handleGenerationSpeedChange}
               onOpenProviders={() => setSettingsTab("providers")}
               toolCallsDefaultCollapsed={toolCallsDefaultCollapsed}
+              hideThinkingBlock={hideThinkingBlock}
             />
           ) : initialCwdStatus === "validating" ? (
-            <div
-              role="status"
-              style={{ height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 8, padding: 24, color: "var(--text-muted)", textAlign: "center" }}
-            >
-              <div style={{ fontSize: 14, color: "var(--text)" }}>{t("appShell.openingWorkspace")}</div>
-              <div style={{ maxWidth: "min(720px, 100%)", overflowWrap: "anywhere", fontFamily: "var(--font-mono)", fontSize: 12 }}>
-                {initialNavigation.requestedCwd}
-              </div>
-            </div>
+            <WorkspaceState
+              kind="loading"
+              title={t("appShell.openingWorkspace")}
+              detail={<span className="workspace-state-path">{initialNavigation.requestedCwd}</span>}
+            />
           ) : initialCwdStatus === "error" ? (
-            <div
-              role="alert"
-              style={{ height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 8, padding: 24, color: "var(--text-muted)", textAlign: "center" }}
-            >
-              <div style={{ fontSize: 14, color: "var(--status-error)" }}>{t("appShell.unableToOpenWorkspace")}</div>
-              <div style={{ maxWidth: "min(720px, 100%)", overflowWrap: "anywhere", fontFamily: "var(--font-mono)", fontSize: 12 }}>
-                {initialNavigation.requestedCwd}
-              </div>
-              <div style={{ maxWidth: 720, fontSize: 12 }}>{initialCwdError}</div>
-            </div>
+            <WorkspaceState
+              kind="error"
+              title={t("appShell.unableToOpenWorkspace")}
+              detail={(
+                <>
+                  <span className="workspace-state-path">{initialNavigation.requestedCwd}</span>
+                  <span>{initialCwdError}</span>
+                </>
+              )}
+            />
           ) : !showPlaceholder ? (
             <PanelLoadingFallback />
+          ) : activeCwd ? (
+            <WorkspaceState kind="empty" title={t("appShell.selectSessionHint")} />
           ) : (
-            activeCwd ? (
-              <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)", fontSize: 16 }}>
-                <span className="display-serif">{t("appShell.selectSessionHint")}</span>
-              </div>
-            ) : (
-              <div style={{ position: "absolute", top: 12, left: 12, display: "flex", alignItems: "flex-start", gap: 8, userSelect: "none", pointerEvents: "none" }}>
+              <div style={{ position: "absolute", top: 12, left: 12, display: "flex", alignItems: "flex-start", gap: 8, userSelect: "none" }}>
                 <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" style={{ opacity: 0.7, flexShrink: 0 }}>
                   <line x1="20" y1="12" x2="4" y2="12" /><polyline points="10 6 4 12 10 18" />
                 </svg>
@@ -2139,16 +2312,34 @@ export function AppShell() {
                         </>
                       );
                     })()}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSidebarOpen(true);
+                      setAddProjectOpen(true);
+                    }}
+                    style={{ display: "flex", alignItems: "center", gap: 6, width: "fit-content", minHeight: 36, marginTop: 12, padding: "7px 10px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "var(--bg-panel)", color: "var(--text)", cursor: "pointer", fontSize: 12, fontWeight: 600, boxShadow: "var(--shadow-card)" }}
+                    className="ui-focus-ring"
+                  >
+                    <Folder size={14} strokeWidth={1.8} aria-hidden="true" />
+                    {t("appShell.openWorkspaces")}
+                  </button>
                   </div>
                 </div>
               </div>
-            )
           )}
         </div>
           </>
         )}
       </main>
-      {!settingsTab && (
+      {rightPanelIsModal && (
+        <div
+          className="right-panel-backdrop"
+          aria-hidden="true"
+          onClick={() => setRightPanelOpen(false)}
+        />
+      )}
+      {!settingsTab && rightPanelHasOpened && (
         <RightPanel
         fileTabs={fileTabs}
         activeFileTabId={activeFileTabId}
@@ -2157,7 +2348,7 @@ export function AppShell() {
         rightPanelOpen={rightPanelOpen}
         rightPanelWidth={rightPanelWidth}
         rightPanelResizing={rightPanelResizing}
-        rightPanelRef={rightPanelRef}
+        rightPanelRef={attachRightPanel}
         fileExplorerRef={fileExplorerRef}
         revealPath={revealPath}
         onRevealDone={handleRevealDone}
@@ -2173,6 +2364,7 @@ export function AppShell() {
         explorerIsRepo={explorerIsRepo}
         explorerRefreshing={explorerRefreshing}
         isMobile={isMobile}
+        isCompactOverlay={isCompactOverlay}
         onOpenFile={handleOpenFile}
         onSelectFileTab={handleSelectFileTab}
         onCloseFileTab={handleCloseFileTab}
@@ -2197,24 +2389,22 @@ export function AppShell() {
     </div>
     {!settingsTab && (
       <button
-      onClick={() => setRightPanelOpen((v) => !v)}
-      title={rightPanelOpen ? t("appShell.hideFilePanel") : t("appShell.showFilePanel")}
-      aria-label={rightPanelOpen ? t("appShell.hideFilePanel") : t("appShell.showFilePanel")}
-      style={{
-        position: "fixed", top: 0, right: 0, zIndex: 300,
-        display: "flex", alignItems: "center", justifyContent: "center",
-        width: isMobile ? 44 : 36, height: isMobile ? 44 : 36, padding: 0,
-        background: "var(--bg-panel)", border: "none", borderLeft: "1px solid var(--border)", borderBottom: "1px solid var(--border)",
-        color: rightPanelOpen ? "var(--text)" : "var(--text-muted)",
-        cursor: "pointer", transition: "color var(--dur-fast) var(--ease-out-warm)",
-      }}
-      onMouseEnter={(e) => { e.currentTarget.style.color = "var(--text)"; }}
-      onMouseLeave={(e) => { e.currentTarget.style.color = rightPanelOpen ? "var(--text)" : "var(--text-muted)"; }}
-    >
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-        <rect x="3" y="3" width="18" height="18" rx="2" /><line x1="15" y1="3" x2="15" y2="21" />
-      </svg>
-    </button>
+        type="button"
+        className="shell-toolbar-btn shell-panel-toggle ui-focus-ring"
+        onClick={() => setRightPanelOpen((v) => !v)}
+        aria-expanded={rightPanelOpen}
+        aria-controls="workspace-file-panel"
+        aria-pressed={rightPanelOpen}
+        title={rightPanelOpen ? t("appShell.hideFilePanel") : t("appShell.showFilePanel")}
+        aria-label={rightPanelOpen ? t("appShell.hideFilePanel") : t("appShell.showFilePanel")}
+        style={{
+          position: "fixed", top: "env(safe-area-inset-top, 0px)", right: "env(safe-area-inset-right, 0px)", zIndex: 300,
+          width: isMobile ? 44 : 36, height: isMobile ? 44 : 36, padding: 0,
+          borderLeft: "1px solid var(--border)", borderBottom: "1px solid var(--border)",
+        }}
+      >
+        {rightPanelOpen ? <X size={16} strokeWidth={1.8} aria-hidden="true" /> : <PanelRight size={16} strokeWidth={1.8} aria-hidden="true" />}
+      </button>
     )}
     <AppUpdateDialog open={appUpdateDialogOpen} update={appUpdate} phase={appUpdatePhase} visibleStage={appUpdateVisibleStage} error={appUpdateError} onProceed={() => void proceedWithAppUpdate()} onNotNow={dismissAppUpdate} />
     {archiveBrowserOpen && (

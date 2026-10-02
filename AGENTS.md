@@ -69,14 +69,17 @@ app/api/
   cwd/validate/route.ts           POST validate/select a cwd
   default-cwd/route.ts            POST create ~/omp-cwd-YYYYMMDD
   files/[...path]/route.ts        GET file contents for viewer
+  github-repo/route.ts            GET ?cwd= — GitHub owner/repo of the checkout (for #N links)
   home/route.ts                   GET user home directory
   models/route.ts                 GET { models, modelList, defaultModel }
   models-config/route.ts          GET/PUT — read/write ~/.omp/agent/models.yml
   models-config/test/route.ts     POST test a configured model/provider
   omp-settings/route.ts           GET/PUT native config.yml settings (allow-listed)
+  web-settings/route.ts           GET/PUT omp-web's own server settings (auto-resume)
   mcp/route.ts                    GET/POST/PUT/DELETE project MCP servers
   plugins/route.ts                GET/POST plugin management (shells out to `omp plugin`)
   projects/route.ts               GET registered+discovered projects | POST add | DELETE hide
+  projects/clone/route.ts         POST clone a git URL into a new workspace (NDJSON progress) | DELETE cancel
   skills/route.ts                 GET/PATCH loaded skills and disable-model-invocation
   skills/install/route.ts         POST install skills through npx skills add
   skills/search/route.ts          GET/POST skills.sh search
@@ -88,6 +91,9 @@ lib/
   draft-store.ts       local draft persistence helpers
   file-access.ts       allowed file roots for /api/files and worktrees
   file-paths.ts        client/server path encoding helpers
+  github-refs.ts       remark plugin linking #N / owner/repo#N + GithubRepoContext
+  git-clone.ts         pure clone helpers: URL→directory name (https/ssh only), \r-aware progress log
+  github-repo.ts       server: pick the gh-default GitHub remote from git config
   markdown.ts          shared markdown helpers
   npx.ts               npx runner used by skill install
   pi-types.ts          local structural types for agent/RPC objects
@@ -95,10 +101,13 @@ lib/
   project-registry.ts  on-disk managed-project registry (~/.omp/agent/projects.json)
   rpc-manager.ts       session registry + startRpcSession over RpcProcess
   session-reader.ts    session .jsonl parsing + path cache + buildSessionContext
+  session-resume.ts    running-session list for auto-resume after a restart
+  web-settings.ts      omp-web server settings (~/.omp/agent/omp-web-settings.json)
   skills-service.ts    pure-Node skill discovery mirroring omp's providers
   tool-presets.ts      PRESET_NONE/DEFAULT/FULL + getToolNamesForPreset()
   types.ts             shared TypeScript types
   normalize.ts         normalizeToolCalls() — field name mismatch between file format and our types
+  word-prediction.ts   pure ghost-text arithmetic (advance/accept) for composer word prediction
   worktree.ts          project/worktree resolution and git worktree operations
 
 components/
@@ -121,6 +130,7 @@ components/
   SkillsConfig.tsx    modal for loaded/search/installable skills
   FileExplorer.tsx    file tree inside sidebar
   FileViewer.tsx      file content in a tab
+  GhostMirror.tsx     textarea overlay painting ghost-text word completion
   TabBar.tsx          tab bar (Chat + open file tabs)
   ui/                 shared primitives: Dialog/Tooltip/Collapsible, fields, toast
 
@@ -131,6 +141,7 @@ hooks/
   useIsMobile.ts           responsive breakpoint hook
   usePrefersReducedMotion.ts OS reduce-motion preference (SMIL-safe)
   useTheme.ts              theme state (localStorage key "omp-theme")
+  useWordPrediction.ts     debounced omp predict_word ghost text + feedback
 ```
 
 ---
@@ -142,6 +153,26 @@ hooks/
 - `globalThis` survives Next.js hot-reload; plain module-level Map does not.
 - Idle sessions are disposed after a timeout; concurrent `startRpcSession()`
   calls must share a single start promise.
+
+### Auto-resume after a restart (`lib/session-resume.ts`)
+- Off by default (`autoResumeSessions` in `omp-web-settings.json`). When on,
+  `notifyRunningChange()` keeps `omp-web-interrupted-sessions-<pid>.json` in
+  the agent dir listing sessions that are mid-run; startup
+  (`instrumentation.node.ts`) consumes it, restarts each session and sends
+  `RESUME_PROMPT`.
+- Each instance writes only its own pid's list, so a second omp-web sharing
+  the agent dir (e.g. `npm run dev` beside an installed one) never resumes or
+  overwrites sessions the other is running. Startup claims a list only when its
+  pid is dead or the file predates the last boot, plus the legacy unsuffixed
+  list. Same-boot pid reuse or a zombie writer leaves that list unresumed.
+- A service stop signals every process at once, so an omp child can die
+  before omp-web's own SIGTERM handler runs. A session whose process died
+  therefore stays listed for `EXIT_GRACE_MS`; the shutdown handler freezes the
+  list (`markShuttingDown`) so those deaths count as interrupted, while a
+  crash with omp-web still up is dropped after the window.
+- Only session ids are stored; paths are re-resolved on resume.
+- Known limit: resume does not detect a terminal `omp --resume <id>` started
+  on the same session while omp-web was down; both would write the file.
 
 ### Two kinds of branching — don't confuse them
 - **Fork** (Fork button on user message): creates a new independent `.jsonl` file. Shown as a child in the sidebar tree via `parentSession` header field.
@@ -191,6 +222,8 @@ handled or safely ignored.
   the chat input**, not inside the scrollable message list. `ComposerPanels`
   renders both, each independently collapsible via its header row (`chevron`);
   panels start collapsed (headers always show live progress / running-summary).
+  Non-running chips (terminal or history) nest under a `Completed (N)` toggle
+  inside the roster, collapsed on every mount (not persisted).
   Subagent chips carry live state (pulsing dot while `started`, check/alert/ban
   for terminal states) fed by the same `subagent_lifecycle`/`subagent_progress`
   SSE frames; clicking a chip opens the transcript dialog. `TodoList` keeps a
@@ -221,8 +254,24 @@ handled or safely ignored.
   `?mode=completion` (bounded tail read that also works for transcripts
   beyond the 16MB paging cap) with a live `get_subagents` snapshot fallback
   for header enrichment; it never pages the raw transcript. Subagent ids are
-  `[A-Za-z0-9_-]{1,80}` — the route validates before joining to confine reads
-  to the sibling dir.
+  `[A-Za-z0-9_-]+` segments joined by `.`, because omp names a nested spawn
+  `Parent.Child` (`SUBAGENT_ID_RE` in `lib/subagent-types.ts`, which also
+  keeps `/`, `\` and `..` out of the joined path). The transcript route caps
+  them at 100 characters and validates before joining to confine reads to the
+  sibling dir.
+- **`agent://` links** (`lib/agent-links.ts`): `MarkdownBody` linkifies bare
+  handles and inline code that is exactly a handle (remark plugin), keeps the
+  `agent:` protocol through rehype-sanitize and `urlTransform`, and opens
+  the handle through `AgentLinkContext`, which `ChatWindow` provides with
+  `agentLinkTarget` (dotted nested id first, then the base id; unknown ids
+  open a disk-backed stub). Without a provider the handle renders as plain
+  text. The plugin runs after `remarkGithubRefs` (so `agent://Foo#12` is not an
+  issue link) and never links omp's write-only `agent://all`. Because the
+  shared sanitizer admits `agent:`, every `ReactMarkdown` host must drop
+  rejected hrefs (`defaultUrlTransform(url) || undefined`) — a blank `href=""`
+  links to omp-web itself; `FileViewer` does this.
+  Tool rows (`ToolCallBlock` in `MessageView`) open an `agent://` `path`
+  through the same context.
 - **In-message task summary** (`components/MessageView.tsx` TaskResultPanel):
   the session reader allowlists a SIZE-BOUNDED subset of `task` toolResult
   details (telemetry only — no `output`/`stderr`, long text truncated to
@@ -267,6 +316,18 @@ handled or safely ignored.
   project rows are cards matching the session items' height/margins/accent
   treatment, and the active project's worktree selector renders directly
   below its row.
+
+### Clone a repository as a new workspace (`/api/projects/clone`)
+- The Add-workspace `DirectoryPicker` takes an optional Git URL; "Clone here"
+  clones into `<selected dir>/<repo name>`, then registers that directory
+  through the normal `POST /api/projects` path.
+- Only `https://`, `ssh://` and scp-like `user@host:path` URLs are accepted
+  (`cloneDirectoryName`); git also runs with `GIT_ALLOW_PROTOCOL=https:ssh`
+  and `GIT_TERMINAL_PROMPT=0`, so credentials must come from helpers/agents.
+- The POST streams NDJSON (`output` chunks, then one of `done` / `cancelled` /
+  `error`). Cancel is `DELETE { id }`: the POST stream stays open until the
+  partial clone is deleted, so the UI can confirm the cleanup. A client
+  disconnect cancels and cleans up too. An existing target is refused (409).
 
 ### File access allow-list
 - `/api/files` is intentionally not a general filesystem browser. Allowed roots come from session cwds, their resolved project roots, `~/omp-cwd-*`, and roots explicitly added with `allowFileRoot()`.
@@ -326,6 +387,25 @@ handled or safely ignored.
 - Auth flows go through RPC commands (`get_login_providers`, `login`) against the omp child process; credentials live in omp's `agent.db` (SQLite) which omp-web never touches directly.
 - The Models panel reads and writes `models.yml` in the omp agent directory (`~/.omp/agent/models.yml`, `.yaml` fallback).
 - API-key status endpoints must never return the raw key.
+
+### Composer word prediction (`hooks/useWordPrediction.ts`, `components/GhostMirror.tsx`)
+- Ghost text comes from omp's `predict_word` RPC (engine = omp's
+  `spelling.autocomplete` setting; omp applies the prose gates). Tab or →
+  accepts; accept/typed-past outcomes go back as `predict_word_feedback`.
+- Keystroke predictions never spawn or replace an omp child: the agent route
+  answers `{ suffix: null }` when no process is alive, so sessions that are not
+  running show no ghost text until the first send.
+- Ghost text paints only when the caret ends its line (the mirror overlay would
+  otherwise overlap typed text). Settings → Interface & Behavior → Word
+  completion (`lib/composer-prefs.ts`, localStorage `omp-web:word-completion`):
+  Auto (default) enables it only when the primary pointer is fine
+  (`(pointer: fine)` — mouse/trackpad; browsers cannot detect an on-screen
+  keyboard), Enabled/Disabled force it. Also skipped for
+  drafts past 20k chars (omp's prose-gate cap); an omp without `predict_word`
+  ("Unknown command") pauses requests for a minute.
+- Ghost state lives in a small external store (`useSyncExternalStore` in
+  `GhostMirror`), not ChatInput state: re-rendering the composer per ghost
+  change was the dominant per-keystroke cost.
 
 ### Completion sound
 - `hooks/useAudio.ts` stores the toggle in `localStorage` and reuses one `AudioContext`.

@@ -1,9 +1,11 @@
 "use client";
 
-import { memo, useState, useId, useRef, useEffect, useMemo, useCallback, type ComponentProps } from "react";
-import { Copy, Check, GitFork, CornerUpLeft, ChevronRight, ChevronDown, Brain, EyeOff, CircleAlert, CircleSlash, LoaderCircle, FileText, Search, FileEdit, Terminal, CheckSquare, Bot, Code2, Globe, MessagesSquare, Wrench } from "lucide-react";
+import { memo, useState, useId, useRef, useEffect, useLayoutEffect, useMemo, useCallback, useContext, type ComponentProps } from "react";
+import { Copy, Check, GitFork, CornerUpLeft, ChevronRight, ChevronDown, Brain, EyeOff, CircleAlert, CircleSlash, LoaderCircle, FileText, Search, FileEdit, Terminal, CheckSquare, Bot, Code2, Globe, MessagesSquare, Wrench, Volume2, Square } from "lucide-react";
 import { MarkdownBody } from "./MarkdownBody";
+import { AgentLinkContext, agentLinkIds } from "../lib/agent-links";
 import { MessageCopyActions } from "./MessageCopyActions";
+import { useSpeechContext } from "@/hooks/useSpeechSynthesis";
 import { ClickableImage } from "./ImageLightbox";
 import { translate, useI18n, type Locale } from "@/lib/i18n";
 import { parseCompactionSummary } from "@/lib/compaction-summary";
@@ -13,6 +15,7 @@ import { useCopyFeedback } from "@/hooks/useCopyFeedback";
 import { formatCompactNumber } from "@/lib/format";
 import { TaskResultPanel } from "./MessageView-task-panel";
 import { HubResultPanel } from "./MessageView-hub-panel";
+import { isMessageOverflowing } from "@/lib/message-overflow";
 import { getResultDiff, PairedDiffResult, PairedResult } from "./MessageView-diff-view";
 import {
   getToolPreview,
@@ -203,6 +206,10 @@ interface Props {
   prevTimestamp?: number;
   sessionId?: string;
   toolCallsDefaultCollapsed?: boolean;
+  /** omp `hideThinkingBlock`: omit thinking blocks. */
+  hideThinking?: boolean;
+  /** Source `content` index of each block when `message` carries a subset of an entry's blocks, so deferred thinking loads the right block. */
+  sourceBlockIndices?: number[];
   /** omp-reported output throughput (get_state.tokensPerSecond), live while streaming. */
   liveTokensPerSecond?: number | null;
 }
@@ -234,12 +241,12 @@ function haveSameRelevantToolResults(
   return true;
 }
 
-export const MessageView = memo(function MessageView({ message, isStreaming, toolResults, modelNames, cwd, onOpenFile, entryId, forkEntryId, onFork, forking, onNavigate, prevAssistantEntryId, onEditContent, showTimestamp, prevTimestamp, sessionId, toolCallsDefaultCollapsed = true, liveTokensPerSecond }: Props) {
+export const MessageView = memo(function MessageView({ message, isStreaming, toolResults, modelNames, cwd, onOpenFile, entryId, forkEntryId, onFork, forking, onNavigate, prevAssistantEntryId, onEditContent, showTimestamp, prevTimestamp, sessionId, toolCallsDefaultCollapsed = true, hideThinking = false, sourceBlockIndices, liveTokensPerSecond }: Props) {
   if (message.role === "user") {
     return <UserMessageView message={message as UserMessage} cwd={cwd} onOpenFile={onOpenFile} entryId={entryId} onFork={onFork} forking={forking} onNavigate={onNavigate} prevAssistantEntryId={prevAssistantEntryId} onEditContent={onEditContent} />;
   }
   if (message.role === "assistant") {
-    return <AssistantMessageView message={message as AssistantMessage} isStreaming={isStreaming} toolResults={toolResults} modelNames={modelNames} cwd={cwd} onOpenFile={onOpenFile} showTimestamp={showTimestamp} prevTimestamp={prevTimestamp} sessionId={sessionId} entryId={entryId} forkEntryId={forkEntryId} onFork={onFork} forking={forking} toolCallsDefaultCollapsed={toolCallsDefaultCollapsed} liveTokensPerSecond={liveTokensPerSecond} />;
+    return <AssistantMessageView message={message as AssistantMessage} isStreaming={isStreaming} toolResults={toolResults} modelNames={modelNames} cwd={cwd} onOpenFile={onOpenFile} showTimestamp={showTimestamp} prevTimestamp={prevTimestamp} sessionId={sessionId} entryId={entryId} forkEntryId={forkEntryId} onFork={onFork} forking={forking} toolCallsDefaultCollapsed={toolCallsDefaultCollapsed} hideThinking={hideThinking} sourceBlockIndices={sourceBlockIndices} liveTokensPerSecond={liveTokensPerSecond} />;
   }
   if (message.role === "toolResult") {
     // Rendered inline under its toolCall — skip standalone rendering if paired
@@ -280,6 +287,8 @@ export const MessageView = memo(function MessageView({ message, isStreaming, too
     && prev.prevTimestamp === next.prevTimestamp
     && prev.sessionId === next.sessionId
     && prev.toolCallsDefaultCollapsed === next.toolCallsDefaultCollapsed
+    && prev.hideThinking === next.hideThinking
+    && prev.sourceBlockIndices?.join() === next.sourceBlockIndices?.join()
     && (!prev.isStreaming || prev.liveTokensPerSecond === next.liveTokensPerSecond);
 });
 
@@ -348,6 +357,8 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
 }) {
   const { t, locale } = useI18n();
   const bodyRef = useRef<HTMLDivElement>(null);
+  const [expanded, setExpanded] = useState(false);
+  const [hasOverflow, setHasOverflow] = useState(false);
 
   const content =
     typeof message.content === "string"
@@ -361,6 +372,20 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
     typeof message.content === "string"
       ? []
       : message.content.filter((b): b is ImageContent => b.type === "image");
+  useLayoutEffect(() => {
+    const element = bodyRef.current;
+    if (!element) return;
+    const observedElement = element;
+    const updateOverflow = () => setHasOverflow(isMessageOverflowing(observedElement));
+    updateOverflow();
+    observedElement.addEventListener("scroll", updateOverflow, { passive: true });
+    const observer = typeof ResizeObserver !== "undefined" ? new ResizeObserver(updateOverflow) : null;
+    observer?.observe(observedElement);
+    return () => {
+      observedElement.removeEventListener("scroll", updateOverflow);
+      observer?.disconnect();
+    };
+  }, [content, imageBlocks.length]);
 
   const time = formatTime(message.timestamp, locale);
   const canFork = !!entryId && !!onFork;
@@ -375,20 +400,22 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
           className="chat-message-card"
           ref={bodyRef}
           data-selection-scope="message"
+          data-overflow={hasOverflow && !expanded ? "true" : undefined}
           tabIndex={-1}
           style={{
             maxWidth: "100%",
             minWidth: 0,
             background: "var(--user-bg)",
-            border: "1px solid color-mix(in srgb, var(--accent) 28%, transparent)",
+            border: "none",
+            borderLeft: "3px solid var(--accent)",
             borderRadius: "var(--radius-card)",
-            boxShadow: "var(--shadow-card)",
+            boxShadow: "none",
             padding: "8px 12px",
             fontSize: "var(--chat-user-font-size)",
             lineHeight: "var(--chat-line-height)",
             color: "var(--text)",
             wordBreak: "break-word",
-            maxHeight: USER_BUBBLE_MAX_HEIGHT,
+            maxHeight: expanded ? "none" : USER_BUBBLE_MAX_HEIGHT,
             overflowY: "auto",
           }}
         >
@@ -411,6 +438,23 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
           )}
           {content && <div data-message-text><SafeMarkdownBody className="markdown-user-message" cwd={cwd} onOpenFile={onOpenFile}>{content}</SafeMarkdownBody></div>}
         </div>
+        {/* Expanding removes the cap, so the bubble stops overflowing; keep the toggle to collapse it again.
+            Collapsing restores the cap: assume overflow until the next measurement so the focused toggle stays mounted. */}
+        {(hasOverflow || expanded) && (
+          <button
+            type="button"
+            className="message-overflow-toggle ui-focus-ring"
+            aria-expanded={expanded}
+            aria-label={expanded ? t("messageView.collapseInput") : t("messageView.showFullInput")}
+            onClick={() => {
+              if (expanded) setHasOverflow(true);
+              setExpanded(!expanded);
+            }}
+          >
+            <span>{expanded ? t("messageView.collapseInput") : t("messageView.showFullInput")}</span>
+            <ChevronDown size={12} strokeWidth={1.8} aria-hidden="true" style={{ transform: expanded ? "rotate(180deg)" : "none" }} />
+          </button>
+        )}
 
         {/* Bottom row: action buttons + timestamp — inside the bubble's column,
             spanning its width, so the timestamp aligns with its right edge. */}
@@ -490,6 +534,8 @@ function AssistantMessageView({
   onFork,
   forking,
   toolCallsDefaultCollapsed,
+  hideThinking,
+  sourceBlockIndices,
   liveTokensPerSecond,
 }: {
   message: AssistantMessage;
@@ -507,16 +553,27 @@ function AssistantMessageView({
   onFork?: (entryId: string) => void;
   forking?: boolean;
   toolCallsDefaultCollapsed: boolean;
+  hideThinking: boolean;
+  sourceBlockIndices?: number[];
   liveTokensPerSecond?: number | null;
 }) {
   const { t, locale } = useI18n();
+  const { isSupported: ttsSupported, isSpeaking: ttsSpeaking, speakingId: ttsSpeakingId, toggle: ttsToggle } = useSpeechContext();
+  const speakableText = useMemo(() => {
+    return (message.content ?? [])
+      .filter((b): b is TextContent => b.type === "text" && typeof b.text === "string")
+      .map((b) => b.text)
+      .join("\n\n");
+  }, [message.content]);
+  const messageSpeechId = entryId ?? (message.timestamp ? String(message.timestamp) : "msg");
+  const isThisSpeaking = ttsSpeaking && ttsSpeakingId === messageSpeechId;
   const time = showTimestamp ? formatTime(message.timestamp, locale) : null;
   const bodyRef = useRef<HTMLDivElement>(null);
   const texts = (message.content ?? []).filter((block): block is TextContent => block.type === "text").map((block) => block.text);
   const canFork = !!forkEntryId && !!onFork;
   const blockItems = (message.content ?? [])
-    .map((block, originalIndex) => ({ block, originalIndex }))
-    .filter(({ block }) => !isEmptyThinkingBlock(block, { isStreaming }));
+    .map((block, index) => ({ block, originalIndex: sourceBlockIndices?.[index] ?? index }))
+    .filter(({ block }) => !(hideThinking && block.type === "thinking") && !isEmptyThinkingBlock(block, { isStreaming }));
   const blocks = blockItems.map(({ block }) => block);
   const hasActivityBlocks = blocks.some((block) => block.type === "thinking" || block.type === "toolCall");
   const errorMessage = message.errorMessage?.trim() || null;
@@ -604,6 +661,7 @@ function AssistantMessageView({
   return (
     <div
       className="chat-message"
+      data-live={isStreaming ? "true" : undefined}
       style={{ marginBottom: 6 }}
     >
       {/* Model label */}
@@ -735,10 +793,24 @@ function AssistantMessageView({
         )}
       </div>
 
-      {!isStreaming && (texts.some((text) => text.trim()) || time || canFork) && (
+      {!isStreaming && (texts.some((text) => text.trim()) || time || canFork || (ttsSupported && speakableText.trim().length > 0)) && (
         <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 6, marginTop: 3 }}>
           <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 3 }}>
             <MessageCopyActions texts={texts} bodyRef={bodyRef} />
+            {ttsSupported && speakableText.trim().length > 0 && (
+              <Tooltip content={isThisSpeaking ? t("messageView.stopSpeech") : t("messageView.readAloud")}>
+                <button
+                  type="button"
+                  className="message-copy-action"
+                  onClick={() => ttsToggle(messageSpeechId, speakableText)}
+                  aria-label={isThisSpeaking ? t("messageView.stopSpeech") : t("messageView.readAloud")}
+                  style={isThisSpeaking ? { color: "var(--accent)", background: "var(--bg-hover)" } : undefined}
+                >
+                  {isThisSpeaking ? <Square size={13} aria-hidden="true" /> : <Volume2 size={13} aria-hidden="true" />}
+                  <span>{isThisSpeaking ? t("messageView.stopSpeech") : t("messageView.readAloud")}</span>
+                </button>
+              </Tooltip>
+            )}
             {canFork && <ForkSessionButton entryId={forkEntryId!} onFork={onFork!} forking={forking} />}
           </div>
           {time && <span style={{ fontSize: 10, color: "var(--text-dim)", marginLeft: "auto" }}>{time}</span>}
@@ -863,6 +935,17 @@ function inputsShallowEqual(a: unknown, b: unknown): boolean {
   return keysA.every((k) => (a as Record<string, unknown>)[k] === (b as Record<string, unknown>)[k]);
 }
 
+/** The page a `read` of an http(s) URL fetched, without read selectors such as `:raw` or `:10-20`. */
+function readTargetWebUrl(target: string): string | null {
+  try {
+    const url = new URL(target);
+    url.pathname = url.pathname.replace(/(?::(?:raw|-?\d[\d,+-]*))+$/, "");
+    return url.href;
+  } catch {
+    return null;
+  }
+}
+
 const ToolCallBlock = memo(function ToolCallBlock({
   block,
   result,
@@ -882,6 +965,7 @@ const ToolCallBlock = memo(function ToolCallBlock({
   onOpenFile?: (filePath: string) => void;
 }) {
   const { t } = useI18n();
+  const openAgentLink = useContext(AgentLinkContext);
   // `partial` results are omp's live snapshots for a tool that is still
   // executing (see lib/types.ts); the committed toolResult replaces them.
   const isRunning = result?.partial === true;
@@ -940,9 +1024,14 @@ const ToolCallBlock = memo(function ToolCallBlock({
       ? hubJobs.map((job) => job.label).join(" · ")
       : null;
 
-  const cleanFilePath = semantic.isFile && typeof block.input === "object" && block.input && "path" in block.input
-    ? String((block.input as Record<string, unknown>).path).split(":")[0]
+  const rawFilePath = semantic.isFile && typeof block.input === "object" && block.input && "path" in block.input
+    ? String((block.input as Record<string, unknown>).path).trim()
     : null;
+  const agentIds = agentLinkIds(rawFilePath ?? undefined);
+  // `history://`, `proc://`, `local://`, ... are resolved by omp, not files the viewer can open.
+  const hasUrlScheme = rawFilePath !== null && /^[a-z][a-z0-9+.-]*:\/\//i.test(rawFilePath);
+  const webUrl = hasUrlScheme && /^https?:\/\//i.test(rawFilePath) ? readTargetWebUrl(rawFilePath) : null;
+  const cleanFilePath = rawFilePath && !hasUrlScheme ? rawFilePath.split(":")[0] : null;
 
   return (
     <div className={inGroup ? "activity-group-item" : "activity-row"} data-activity-operation="true">
@@ -964,7 +1053,26 @@ const ToolCallBlock = memo(function ToolCallBlock({
           </span>
           <span className={`activity-row-tool${isError ? " activity-row-tool-error" : ""}`}>{hubTool ?? block.toolName}</span>
           <span className="activity-row-preview">
-            {cleanFilePath && onOpenFile ? (
+            {agentIds.length > 0 && openAgentLink ? (
+              <span
+                role="link"
+                tabIndex={0}
+                className="activity-file-link"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  openAgentLink(agentIds);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.stopPropagation();
+                    openAgentLink(agentIds);
+                  }
+                }}
+                title={hubPreview ?? preview}
+              >
+                {hubPreview ?? preview}
+              </span>
+            ) : cleanFilePath && onOpenFile ? (
               <span
                 role="button"
                 tabIndex={0}
@@ -980,6 +1088,25 @@ const ToolCallBlock = memo(function ToolCallBlock({
                   }
                 }}
                 title={hubPreview ?? preview}
+              >
+                {hubPreview ?? preview}
+              </span>
+            ) : webUrl ? (
+              <span
+                role="link"
+                tabIndex={0}
+                className="activity-file-link"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  window.open(webUrl, "_blank", "noopener,noreferrer");
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.stopPropagation();
+                    window.open(webUrl, "_blank", "noopener,noreferrer");
+                  }
+                }}
+                title={webUrl}
               >
                 {hubPreview ?? preview}
               </span>
@@ -1279,7 +1406,7 @@ function CompactionFileList({ title, files }: { title: string; files: string[] }
 function stripHiddenWrappers(text: string): string {
   let t = text.trim();
   t = t.replace(/^<!--[\s\S]*?-->\s*/, "").trim();
-  const outer = t.match(/^<([a-zA-Z0-9_-]+)(?:\s[^>]*)?>\s*([\s\S]*?)\s*<\/\1>\s*$/);
+  const outer = t.match(/^<([a-zA-Z0-9_-]+)(?:\s(?:[^>"]|"[^"]*")*)?>\s*([\s\S]*?)\s*<\/\1>\s*$/);
   if (outer) return outer[2].trim();
   return t;
 }
@@ -1497,7 +1624,11 @@ function HiddenExtensionView({ message, cwd, onOpenFile }: { message: CustomMess
 
 function CustomMessageView({ message, cwd, onOpenFile }: { message: CustomMessage; cwd?: string; onOpenFile?: (filePath: string) => void }) {
   const { t, locale } = useI18n();
-  const [contentExpanded, setContentExpanded] = useState(true);
+  // Reminders and job notices are activity, as in the TUI: start collapsed to
+  // their first line; the header toggles them like a tool call.
+  const isDeveloper = message.customType === "developer";
+  const isNotice = isDeveloper || message.customType === "async-result" || message.customType === "lsp-late-diagnostic";
+  const [contentExpanded, setContentExpanded] = useState(!isNotice);
   const [detailsExpanded, setDetailsExpanded] = useState(false);
   const { copied, copy: copyContent } = useCopyFeedback();
   const text = getMessageText(message.content);
@@ -1506,8 +1637,19 @@ function CustomMessageView({ message, cwd, onOpenFile }: { message: CustomMessag
   const detailsText = hasDetails ? safeJson(message.details) : "";
   const isIrc = IRC_CUSTOM_TYPES.has(message.customType);
   const ircEnvelope = isIrc ? parseIrcEnvelope(text) : null;
-  const displayText = ircEnvelope ? ircEnvelope.body : text;
-  const title = isIrc
+  // Async results (raw job output) and late LSP diagnostics are plain text wrapped
+  // in <system-notice>. As markdown the wrapper turns the body into one raw HTML
+  // block (newlines collapse) and `---` becomes a heading, so strip it and show
+  // them verbatim.
+  const isPlainText = message.customType === "async-result" || message.customType === "lsp-late-diagnostic";
+  const displayText = ircEnvelope ? ircEnvelope.body : isPlainText || isDeveloper ? stripHiddenWrappers(text) : text;
+  // `<system-reminder reason="…" rule="…">` → "system-reminder · reason=… · rule=…".
+  const wrapper = isDeveloper ? text.trim().match(/^<([\w-]+)((?:\s+[\w-]+="[^"]*")*)\s*>/) : null;
+  const firstLine = displayText.split("\n").find((line) => line.trim())?.trim() ?? "";
+  const collapsedPreview = firstLine && firstLine !== displayText.trim() ? `${firstLine} …` : firstLine;
+  const title = wrapper
+    ? [wrapper[1], ...[...wrapper[2].matchAll(/([\w-]+)="([^"]*)"/g)].map((attr) => `${attr[1]}=${attr[2]}`)].join(" · ")
+    : isIrc
     ? (ircEnvelope?.sender ?? formatCustomType(message.customType))
     : message.customType === "advisor"
       ? t("messageView.advisorLabel")
@@ -1528,6 +1670,11 @@ function CustomMessageView({ message, cwd, onOpenFile }: { message: CustomMessag
         }}
       >
         <div
+          role={isNotice ? "button" : undefined}
+          tabIndex={isNotice ? 0 : undefined}
+          aria-expanded={isNotice ? contentExpanded : undefined}
+          onClick={isNotice ? () => setContentExpanded((v) => !v) : undefined}
+          onKeyDown={isNotice ? (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setContentExpanded((v) => !v); } } : undefined}
           style={{
             userSelect: "none",
             display: "flex",
@@ -1538,12 +1685,28 @@ function CustomMessageView({ message, cwd, onOpenFile }: { message: CustomMessag
             background: "var(--bg-panel)",
             color: "var(--text-muted)",
             fontSize: 12,
+            cursor: isNotice ? "pointer" : undefined,
           }}
         >
-          <span style={{ color: "var(--text-muted)", fontFamily: "var(--font-mono)", fontSize: 11, fontWeight: 650 }}>
+          {isNotice && (
+            <ChevronDown size={12} strokeWidth={1.8} aria-hidden="true" style={{ flexShrink: 0, transform: contentExpanded ? "none" : "rotate(-90deg)" }} />
+          )}
+          <span
+            style={{
+              color: "var(--text-muted)",
+              fontFamily: "var(--font-mono)",
+              fontSize: 11,
+              fontWeight: 650,
+              minWidth: 0,
+              // Collapsed notices keep the header to one line, like a tool call's arguments.
+              ...(isNotice && !contentExpanded
+                ? { whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }
+                : { overflowWrap: "anywhere" }),
+            }}
+          >
             {isIrc && message.customType === "irc:incoming" ? `← ${title}` : title}
           </span>
-          {time && <span style={{ marginLeft: "auto", color: "var(--text-dim)", fontSize: 10 }}>{time}</span>}
+          {time && <span style={{ marginLeft: "auto", flexShrink: 0, color: "var(--text-dim)", fontSize: 10 }}>{time}</span>}
         </div>
 
         {contentExpanded ? (
@@ -1564,7 +1727,15 @@ function CustomMessageView({ message, cwd, onOpenFile }: { message: CustomMessag
                 })}
               </div>
             )}
-            {displayText ? <MarkdownBody className="markdown-custom-message" cwd={cwd} onOpenFile={onOpenFile}>{displayText}</MarkdownBody> : <span style={{ color: "var(--text-dim)", fontSize: 12 }}>{t("messageView.noMessage")}</span>}
+            {!displayText ? (
+              <span style={{ color: "var(--text-dim)", fontSize: 12 }}>{t("messageView.noMessage")}</span>
+            ) : isPlainText ? (
+              <pre style={{ margin: 0, maxHeight: 420, overflow: "auto", whiteSpace: "pre", fontFamily: "var(--font-mono)", fontSize: 12, lineHeight: 1.5, color: "var(--text-muted)" }}>
+                {displayText}
+              </pre>
+            ) : (
+              <MarkdownBody className="markdown-custom-message" cwd={cwd} onOpenFile={onOpenFile}>{displayText}</MarkdownBody>
+            )}
           </div>
         ) : (
           <button
@@ -1579,9 +1750,10 @@ function CustomMessageView({ message, cwd, onOpenFile }: { message: CustomMessag
               cursor: "pointer",
               fontSize: 12,
               textAlign: "left",
+              ...(isNotice ? { whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } : {}),
             }}
           >
-            {displayText ? previewText(displayText) : t("messageView.showExtensionMessage")}
+            {isNotice && collapsedPreview ? collapsedPreview : displayText ? previewText(displayText) : t("messageView.showExtensionMessage")}
           </button>
         )}
 
