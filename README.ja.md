@@ -41,6 +41,12 @@
 npx @kahme247/ompweb@latest
 ```
 
+または
+
+```bash
+nix run github:Murkiness4095/ompweb
+```
+
 **またはグローバルにインストール:**
 
 ```bash

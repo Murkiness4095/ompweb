@@ -41,6 +41,12 @@
 npx @kahme247/ompweb@latest
 ```
 
+或
+
+```bash
+nix run github:Murkiness4095/ompweb
+```
+
 **或全局安装：**
 
 ```bash

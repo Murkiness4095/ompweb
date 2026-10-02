@@ -43,7 +43,7 @@ npx @kahme247/ompweb@latest
 
 or
 ```bash
-nix run github:kahme247/ompweb
+nix run github:Murkiness4095/ompweb
 ```
 
 **Or install globally:**
